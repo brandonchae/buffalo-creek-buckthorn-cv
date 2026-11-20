@@ -14,7 +14,7 @@ def download_usgs_naip_geotiff(out_tif="buffalo_creek_naip_4band_live.tif"):
     minx, miny, maxx, maxy = BBOX_WGS84
     url = (
         "https://imagery.nationalmap.gov/arcgis/rest/services/USGSNAIPPlus/ImageServer/exportImage"
-        f"?bbox={minx},{miny},{maxx},{maxy}&bboxSR=4326&size=910,778&imageSR=26916"
+        f"?bbox={minx},{miny},{maxx},{maxy}&bboxSR=4326&size=306,256&imageSR=26916"
         "&format=tiff&pixelType=U8&noDataInterpretation=esriNoDataMatchAny"
         "&interpolation=+RSP_BilinearInterpolation&f=image"
     )
