@@ -31,14 +31,21 @@ def raster_features(arr):
     if arr.ndim != 3 or arr.shape[0] < 4:
         raise ValueError("NAIP raster must have at least four bands in R,G,B,NIR order")
     r,g,b,nir = [arr[i].astype(float) for i in range(4)]
-    ndvi=safe_index(nir,r); gndvi=safe_index(nir,g); grvi=safe_index(g,r); savi=1.5*safe_index(nir,r,0.5)
+    # NAIP is normally 8-bit DN. Index ratios are invariant to this scale;
+    # SAVI's L=0.5 is defined for reflectance in [0,1], so normalize for SAVI.
+    ndvi=safe_index(nir,r); gndvi=safe_index(nir,g); grvi=safe_index(g,r)
+    savi=1.5*safe_index(nir/255.0,r/255.0,0.5)
+    def local_mean(x,size):
+        valid=np.isfinite(x); x0=np.nan_to_num(x)
+        count=uniform_filter(valid.astype(float),size=size)
+        return np.divide(uniform_filter(x0,size=size),count,out=np.full_like(x0,np.nan),where=count>0)
     def local_std(x,size):
         valid=np.isfinite(x); x0=np.nan_to_num(x)
         m=uniform_filter(x0,size=size); m2=uniform_filter(x0*x0,size=size)
         count=uniform_filter(valid.astype(float),size=size)
         return np.sqrt(np.maximum(np.divide(m2,count,out=np.full_like(m,np.nan),where=count>0)-np.square(np.divide(m,count,out=np.full_like(m,np.nan),where=count>0)),0))
     return np.stack([r,g,b,nir,ndvi,gndvi,grvi,savi,
-        uniform_filter(np.nan_to_num(ndvi),size=5),local_std(ndvi,5),local_std(nir,7)])
+        local_mean(ndvi,5),local_std(ndvi,5),local_std(nir,7)])
 
 FEATURES=["red","green","blue","nir","ndvi","gndvi","grvi","savi","ndvi_mean_5","ndvi_sd_5","nir_sd_7"]
 
@@ -53,9 +60,10 @@ def validate_inputs(tif, obs):
     required={"longitude","latitude","label","verification_status","observation_date","observation_id","positional_accuracy_m"}
     missing=required-set(df.columns)
     if missing: raise ValueError(f"Observation CSV missing columns: {sorted(missing)}")
-    if not set(df.label.dropna().unique()).issubset({0,1}): raise ValueError("label must contain only 0/1")
-    if (df.verification_status.astype(str).str.lower().isin(["verified","independently_verified"]).sum()<1):
-        raise ValueError("Require independently verified field labels; iNaturalist alone is not ground truth")
+    if df[list(required)].isna().any().any(): raise ValueError("Required observation metadata may not be missing")
+    if not set(df.label.unique()).issubset({0,1}) or set(df.label.unique())!={0,1}: raise ValueError("Both classes must be present and labels must be 0/1")
+    verified=df.verification_status.astype(str).str.lower().isin(["verified","independently_verified"])
+    if not verified.all(): raise ValueError("Every training label must be independently field verified; iNaturalist is candidate data only")
     return df
 
 def metric_pack(y, p):
@@ -78,7 +86,7 @@ def main():
     points=gpd.GeoDataFrame(df,geometry=gpd.points_from_xy(df.longitude,df.latitude),crs="EPSG:4326").to_crs(TARGET_CRS)
     args.output.mkdir(parents=True,exist_ok=True)
     with rasterio.open(args.imagery) as ds:
-        raw=ds.read(masked=True).filled(np.nan)
+        raw=ds.read(masked=True).astype(np.float32).filled(np.nan)
         feat=raster_features(raw)
         rows=[]
         for geom in points.geometry:
@@ -92,7 +100,9 @@ def main():
         # Spatial blocks are 1 km grid cells; buffer is applied geometrically to each test fold.
         groups=np.floor(pts.geometry.x/1000).astype(int).astype(str)+":"+np.floor(pts.geometry.y/1000).astype(int).astype(str)
         if groups.nunique()<2: raise ValueError("Need at least two spatial blocks")
-        folds=min(5,groups.nunique()); gkf=GroupKFold(n_splits=folds); skf=StratifiedKFold(n_splits=min(5,int(np.bincount(y).min())),shuffle=True,random_state=SEED)
+        folds=min(5,groups.nunique()); min_class=int(np.bincount(y).min())
+        if min_class<2: raise ValueError("At least two verified samples per class are required for stratified CV")
+        gkf=GroupKFold(n_splits=folds); skf=StratifiedKFold(n_splits=min(5,min_class),shuffle=True,random_state=SEED)
         model=RandomForestClassifier(n_estimators=400,min_samples_leaf=2,class_weight="balanced",n_jobs=-1,random_state=SEED)
         results={}
         for name, splitter, grouped in [("spatial",gkf,True),("stratified_baseline",skf,False)]:
@@ -113,7 +123,7 @@ def main():
         profile=ds.profile.copy(); profile.update(count=1,dtype="float32",nodata=-9999,compress="deflate")
         with rasterio.open(args.output/"buckthorn_probability.tif","w",**profile) as out:
             for _, window in ds.block_windows(1):
-                win=ds.read(window=window,masked=True).filled(np.nan); f=raster_features(win)
+                win=ds.read(window=window,masked=True).astype(np.float32).filled(np.nan); f=raster_features(win)
                 matrix=f.reshape(len(FEATURES),-1).T; ok=np.isfinite(matrix).all(axis=1); pred=np.full(len(matrix),-9999,dtype=np.float32)
                 if ok.any(): pred[ok]=model.predict_proba(matrix[ok])[:,1]
                 out.write(pred.reshape(int(window.height),int(window.width)),1,window=window)
