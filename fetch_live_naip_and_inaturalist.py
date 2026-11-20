@@ -1,55 +1,57 @@
+"""Fetch candidate iNaturalist records; never creates training labels.
+
+NAIP acquisition is intentionally explicit: download the appropriate authoritative
+USDA/USGS product for the chosen footprint/year, inspect its metadata, then record
+its provenance in data/imagery_provenance.json. This script will not guess imagery.
 """
-fetch_live_naip_and_inaturalist.py
-Automated fetcher for:
-1. Official USGS/USDA NAIP 4-Band (RGB + NIR) GeoTIFF over Buffalo Creek Forest Preserve (Lake County, IL)
-2. Research-grade iNaturalist GPS observations of Rhamnus cathartica in Lake County, IL
-"""
-import urllib.request
+import argparse
 import json
-import pandas as pd
+from datetime import datetime, timezone
+from pathlib import Path
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
-BBOX_WGS84 = (-88.0120, 42.1590, -88.0010, 42.1660)
+API = "https://api.inaturalist.org/v1/observations"
+TAXON = "Rhamnus cathartica"
 
-def download_usgs_naip_geotiff(out_tif="buffalo_creek_naip_4band_live.tif"):
-    minx, miny, maxx, maxy = BBOX_WGS84
-    url = (
-        "https://imagery.nationalmap.gov/arcgis/rest/services/USGSNAIPPlus/ImageServer/exportImage"
-        f"?bbox={minx},{miny},{maxx},{maxy}&bboxSR=4326&size=306,256&imageSR=26916"
-        "&format=tiff&pixelType=U8&noDataInterpretation=esriNoDataMatchAny"
-        "&interpolation=+RSP_BilinearInterpolation&f=image"
-    )
-    print("Downloading 4-Band NAIP GeoTIFF (EPSG:26916) from USGS National Map...")
-    urllib.request.urlretrieve(url, out_tif)
-    print(f"Saved live NAIP GeoTIFF to {out_tif}")
+def fetch_candidates(out_csv: Path, bbox: tuple[float,float,float,float], max_pages: int = 5):
+    """Save candidate records with IDs, dates, grade, taxon, and uncertainty.
 
-def fetch_inaturalist_buckthorn(out_csv="inaturalist_lake_county_buckthorn.csv"):
-    url = (
-        "https://api.inaturalist.org/v1/observations"
-        "?taxon_name=Rhamnus%20cathartica&quality_grade=research"
-        "&swlat=42.10&swlng=-88.20&nelat=42.35&nelng=-87.85&per_page=200"
-    )
-    print("Querying iNaturalist API v1 for research-grade Rhamnus cathartica in Lake County, IL...")
-    req = urllib.request.Request(url, headers={"User-Agent": "BuffaloCreekBuckthornMapper/2.0"})
-    with urllib.request.urlopen(req) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
-    rows = []
-    for obs in data.get("results", []):
-        geojson = obs.get("geojson")
-        if geojson and "coordinates" in geojson:
-            lon, lat = geojson["coordinates"]
-            rows.append({
-                "INAT_ID": obs["id"],
-                "OBSERVED_ON": obs.get("observed_on"),
-                "LATITUDE": lat,
-                "LONGITUDE": lon,
-                "POSITIONAL_ACCURACY_M": obs.get("positional_accuracy"),
-                "SPECIES": "Rhamnus cathartica",
-                "BUCKTHORN_PRESENT": 1
-            })
-    df = pd.DataFrame(rows)
-    df.to_csv(out_csv, index=False)
-    print(f"Saved {len(df)} research-grade iNaturalist observations to {out_csv}")
+    iNaturalist records are leads for review, not ground-truth presence labels.
+    """
+    import pandas as pd
+    west,south,east,north=bbox
+    rows=[]
+    for page in range(1,max_pages+1):
+        params={"taxon_name":TAXON,"quality_grade":"research","swlat":south,"swlng":west,
+                "nelat":north,"nelng":east,"per_page":200,"page":page,"order":"asc","order_by":"observed_on"}
+        req=Request(API+"?"+urlencode(params),headers={"User-Agent":"BuffaloCreekBuckthornResearch/1.0 (data provenance workflow)"})
+        with urlopen(req,timeout=60) as response: payload=json.load(response)
+        results=payload.get("results",[])
+        for obs in results:
+            coords=(obs.get("geojson") or {}).get("coordinates")
+            if not coords: continue
+            rows.append({"observation_id":str(obs.get("id")),"longitude":coords[0],"latitude":coords[1],
+                "observation_date":obs.get("observed_on"),"taxon_name":(obs.get("taxon") or {}).get("name"),
+                "quality_grade":obs.get("quality_grade"),"positional_accuracy_m":obs.get("positional_accuracy"),
+                "source_url":f"https://www.inaturalist.org/observations/{obs.get('id')}",
+                "verification_status":"candidate_unverified"})
+        if len(results)<200 or len(rows)>=payload.get("total_results",0): break
+    out_csv.parent.mkdir(parents=True,exist_ok=True)
+    pd.DataFrame(rows).to_csv(out_csv,index=False)
+    out_csv.with_suffix(".provenance.json").write_text(json.dumps({"source":API,"taxon":TAXON,"bbox_wgs84":bbox,
+        "retrieved_utc":datetime.now(timezone.utc).isoformat(),"records":len(rows),
+        "interpretation":"Candidate observations only; not validated ground truth. Absence of records is not absence of species."},indent=2))
+    return len(rows)
 
-if __name__ == "__main__":
-    download_usgs_naip_geotiff()
-    fetch_inaturalist_buckthorn()
+def main():
+    ap=argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--bbox",nargs=4,type=float,required=True,metavar=("WEST","SOUTH","EAST","NORTH"),help="WGS84 bounding box")
+    ap.add_argument("--output",type=Path,default=Path("data/inaturalist_candidates.csv"))
+    ap.add_argument("--pages",type=int,default=5)
+    args=ap.parse_args()
+    n=fetch_candidates(args.output,tuple(args.bbox),args.pages)
+    print(f"Saved {n} candidate records to {args.output}; these are not ground-truth labels.")
+    print("NAIP is not fetched automatically. Acquire and document a real USDA/USGS image product separately.")
+
+if __name__=="__main__": main()
