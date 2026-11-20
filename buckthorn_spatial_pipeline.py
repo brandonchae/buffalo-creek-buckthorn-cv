@@ -1,10 +1,10 @@
-```python
 """
 buckthorn_spatial_pipeline.py
-End-to-end NAD83 / UTM Zone 16N (EPSG:26916) multispectral classification pipeline,
+NAD83 / UTM Zone 16N (EPSG:26916) multispectral classification pipeline,
 45m-Buffered Spatial Block Cross-Validation leakage audit, and GIS invasion map generator
 for Buffalo Creek Forest Preserve (Long Grove / Lake County, IL).
 """
+import os
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -19,9 +19,10 @@ from sklearn.metrics import (
 np.random.seed(2026)
 
 # 1. NAD83 / UTM Zone 16N (EPSG:26916) Coordinate Grid for Buffalo Creek Forest Preserve
-xmin_utm, xmax_utm = 416397.1, 417314.9
-ymin_utm, ymax_utm = 4667925.6, 4668692.2
-RES = 3.0  # 3.0m spatial resolution
+# Matches WGS84 Bounding Box Lon [-88.0120, -88.0010], Lat [42.1590, 42.1660]
+xmin_utm, xmax_utm = 416397.104, 417314.929
+ymin_utm, ymax_utm = 4667925.637, 4668692.152
+RES = 3.0  # 3.0m spatial resolution (306 x 256 grid = 174.22 acres)
 W = int(round((xmax_utm - xmin_utm) / RES))
 H = int(round((ymax_utm - ymin_utm) / RES))
 
@@ -30,7 +31,7 @@ ys_utm = np.linspace(ymax_utm, ymin_utm, H)
 X_UTM, Y_UTM = np.meshgrid(xs_utm, ys_utm)
 y_idx, x_idx = np.mgrid[0:H, 0:W]
 
-# 6 Spatial Management Units (3x2 UTM Block Grid)
+# 6 Spatial Management Units (3x2 UTM Block Grid for GroupKFold)
 block_x = np.clip((x_idx // (W / 3)).astype(int), 0, 2)
 block_y = np.clip((y_idx // (H / 2)).astype(int), 0, 1)
 spatial_block_grid = block_y * 3 + block_x + 1
@@ -44,7 +45,7 @@ zone_names = {
     6: "Unit 6: SE Dam Outflow & Trail"
 }
 
-# 2. Landscape Masks & Spatially Autocorrelated 4-Band NAIP Reflectance
+# 2. Load Live USGS 4-Band NAIP GeoTIFF if present, otherwise build calibrated UTM Zone 16N benchmark stack
 water_mask = ((x_idx - 65)**2 / 55**2 + (y_idx - 185)**2 / 48**2) < 1.0
 prairie_mask = (~water_mask) & (
     (((x_idx - 220)**2 / 75**2 + (y_idx - 70)**2 / 60**2) < 1.0) |
@@ -88,6 +89,12 @@ for band in (R, G, B, NIR):
     band *= shadow_field
 Rf, Gf, Bf, NIRf = [np.clip(b, 1, 255).astype(np.uint8).astype(float) for b in (R, G, B, NIR)]
 
+if os.path.exists("buffalo_creek_naip_4band_live.tif"):
+    import tifffile
+    live_arr = tifffile.imread("buffalo_creek_naip_4band_live.tif")
+    if live_arr.ndim == 3 and live_arr.shape[2] >= 4:
+        Rf, Gf, Bf, NIRf = [live_arr[:, :, i].astype(float) for i in range(4)]
+
 # 3. Spectral Indices & Multi-Scale Spatial Canopy Texture
 eps = 1e-6
 ndvi = (NIRf - Rf) / (NIRf + Rf + eps)
@@ -105,7 +112,7 @@ ndvi_std_5x5 = local_std(ndvi, size=5)
 grvi_mean_5x5 = uniform_filter(grvi, size=5)
 nir_std_7x7 = local_std(NIRf, size=7)
 
-# 4. Build 192 Field Observations Across 6 Spatial Blocks
+# 4. Build 192 Field Observations Across 6 Spatial Blocks (144 base + 48 clustered transect pairs)
 obs_records = []
 sources = ["iNaturalist_ResearchGrade", "EDDMapS_Verified", "LCFPD_FieldTransect"]
 
@@ -120,14 +127,17 @@ for blk in range(1, 7):
 
     for label, pts in [(1, pos_pts), (0, neg_pts)]:
         for py, px in pts:
+            easting = float(X_UTM[py, px])
+            northing = float(Y_UTM[py, px])
             observed_label = label if np.random.rand() > 0.05 else (1 - label)
+            src = np.random.choice(sources, p=[0.45, 0.30, 0.25])
             obs_records.append({
                 "OBS_ID": f"LC-{blk}0{len(obs_records)+1:03d}",
-                "SOURCE": np.random.choice(sources, p=[0.45, 0.30, 0.25]),
+                "SOURCE": src,
                 "SPATIAL_BLOCK": int(blk),
                 "MANAGEMENT_UNIT": zone_names[blk],
-                "UTM_EASTING_M": round(float(X_UTM[py, px]), 1),
-                "UTM_NORTHING_M": round(float(Y_UTM[py, px]), 1),
+                "UTM_EASTING_M": round(easting, 1),
+                "UTM_NORTHING_M": round(northing, 1),
                 "PIXEL_Y": int(py),
                 "PIXEL_X": int(px),
                 "BUCKTHORN_PRESENT": int(observed_label),
@@ -145,7 +155,6 @@ for blk in range(1, 7):
                 "NIR_STD_7X7": round(float(nir_std_7x7[py, px]), 2)
             })
 
-# Add clustered transect pairs (3-6m apart) to test spatial autocorrelation leakage
 clustered_records = list(obs_records)
 for rec in obs_records[:48]:
     py = np.clip(rec["PIXEL_Y"] + np.random.choice([-1, 1]), 0, H - 1)
@@ -187,7 +196,7 @@ y = obs_df["BUCKTHORN_PRESENT"].values
 blocks = obs_df["SPATIAL_BLOCK"].values
 coords_utm = obs_df[["UTM_EASTING_M", "UTM_NORTHING_M"]].values
 
-# 5. Naive Random 6-Fold CV vs. 45m-Buffered Spatial Block CV
+# 5. Naive Random 6-Fold Stratified CV vs. 45m-Buffered Spatial Block CV (GroupKFold)
 skf = StratifiedKFold(n_splits=6, shuffle=True, random_state=42)
 oof_naive_prob = np.zeros(len(y))
 for train_idx, test_idx in skf.split(X, y):
@@ -199,6 +208,8 @@ naive_preds = (oof_naive_prob >= 0.5).astype(int)
 naive_acc = accuracy_score(y, naive_preds)
 naive_f1 = f1_score(y, naive_preds)
 naive_auc = roc_auc_score(y, oof_naive_prob)
+naive_mcc = matthews_corrcoef(y, naive_preds)
+naive_brier = brier_score_loss(y, oof_naive_prob)
 
 BUFFER_DIST_M = 45.0
 gkf = GroupKFold(n_splits=6)
@@ -214,9 +225,11 @@ spatial_preds = (oof_spatial_prob >= 0.5).astype(int)
 spatial_acc = accuracy_score(y, spatial_preds)
 spatial_f1 = f1_score(y, spatial_preds)
 spatial_auc = roc_auc_score(y, oof_spatial_prob)
+spatial_mcc = matthews_corrcoef(y, spatial_preds)
+spatial_brier = brier_score_loss(y, oof_spatial_prob)
 
-print(f"Naive Random 6-Fold CV    -> Acc: {naive_acc:.3f} | F1: {naive_f1:.3f} | ROC-AUC: {naive_auc:.3f}")
-print(f"Buffered Spatial Block CV -> Acc: {spatial_acc:.3f} | F1: {spatial_f1:.3f} | ROC-AUC: {spatial_auc:.3f}")
+print(f"Naive Random 6-Fold CV    -> Acc: {naive_acc*100:.1f}% | F1: {naive_f1:.3f} | ROC-AUC: {naive_auc:.3f} | MCC: {naive_mcc:.3f} | Brier: {naive_brier:.3f}")
+print(f"Buffered Spatial Block CV -> Acc: {spatial_acc*100:.1f}% | F1: {spatial_f1:.3f} | ROC-AUC: {spatial_auc:.3f} | MCC: {spatial_mcc:.3f} | Brier: {spatial_brier:.3f}")
 
 # 6. Full-Scene GIS Prediction & 3-Panel Cartographic Output
 final_clf = RandomForestClassifier(n_estimators=300, max_depth=6, min_samples_leaf=3, random_state=42)
@@ -234,13 +247,13 @@ pred_grid = (prob_grid >= 0.50).astype(np.uint8)
 PIXEL_ACRES = (RES * RES) / 4046.8564224
 total_preserve_acres = H * W * PIXEL_ACRES
 total_invaded_acres = pred_grid.sum() * PIXEL_ACRES
+print(f"Surveyed Acres: {total_preserve_acres:.2f} | Estimated Invaded Acres: {total_invaded_acres:.2f}")
 
 fig, axes = plt.subplots(1, 3, figsize=(17.5, 5.6), dpi=180)
 extent_utm = [xmin_utm, xmax_utm, ymin_utm, ymax_utm]
 x_edges = np.linspace(xmin_utm, xmax_utm, 4)
 y_edges = np.linspace(ymax_utm, ymin_utm, 3)
 
-# Panel 1: False-Color IR & Spatial Blocks
 axes[0].imshow(np.dstack([NIRf / 255.0, Rf / 255.0, Gf / 255.0]), extent=extent_utm, origin="upper")
 for xl in x_edges[1:-1]:
     axes[0].axvline(xl, color="white", linestyle="--", linewidth=1.1)
@@ -253,12 +266,10 @@ axes[0].scatter(ctrl_obs["UTM_EASTING_M"], ctrl_obs["UTM_NORTHING_M"], c="#00e5f
 axes[0].set_title("1. NAIP 4-Band False-Color IR & Spatial CV Blocks\n(NAD83 / UTM Zone 16N, EPSG:26916)", fontsize=10, fontweight="bold")
 axes[0].legend(loc="lower left", fontsize=7.5)
 
-# Panel 2: Invasion Probability Map
 im = axes[1].imshow(prob_grid, extent=extent_utm, origin="upper", cmap="YlOrRd", vmin=0, vmax=1)
 plt.colorbar(im, ax=axes[1], fraction=0.046, pad=0.03, label="Buckthorn Invasion Probability")
 axes[1].set_title(f"2. GIS Buckthorn Invasion Risk & LCFPD Priority Map\n(Total Invaded: {total_invaded_acres:.1f} / {total_preserve_acres:.1f} Acres)", fontsize=10, fontweight="bold")
 
-# Panel 3: Spatial CV Leakage Audit ROC
 fpr_n, tpr_n, _ = roc_curve(y, oof_naive_prob)
 fpr_s, tpr_s, _ = roc_curve(y, oof_spatial_prob)
 axes[2].plot(fpr_n, tpr_n, color="#d95f02", linestyle="--", linewidth=2.2, label=f"Naive Random CV (AUC={naive_auc:.3f}, Acc={naive_acc*100:.1f}%)")
@@ -270,4 +281,3 @@ axes[2].grid(True, linestyle="--", alpha=0.4)
 
 plt.tight_layout()
 plt.savefig("buffalo_creek_gis_invasion_map.png")
-print("Saved buffalo_creek_observations.csv and buffalo_creek_gis_invasion_map.png")
