@@ -27,3 +27,4 @@ The baseline is Random Forest. Evaluation includes stratified CV as a comparison
 ## Provenance and limitations
 
 NAIP is a USDA aerial imagery program; obtain imagery from an authoritative USDA/USGS endpoint and record the actual product/version, acquisition year, terms and metadata. iNaturalist observations are community observations under their own licenses and quality controls. This repository does not bundle either dataset, assert that a current API response covers the preserve, establish native controls, or provide field validation. Confirm dataset licensing and all acquisition metadata for the specific files used. Management boundaries are not included; no management-unit summaries are generated.
+
